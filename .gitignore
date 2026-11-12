@@ -1,0 +1,17 @@
+# ---- 构建产物 ----
+build/
+cmake-build-*/
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.iml
+
+# ---- CubeMX 备份 ----
+*.ioc.bak
+*_backup/
