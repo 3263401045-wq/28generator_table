@@ -364,9 +364,9 @@ static bool parse_u32(const char *s, uint32_t *out)
 static void print_help(void)
 {
   CLI_Print("\r\n"
-            " A<deg>  goto angle     A90  A-45.5\r\n"
+            " A<deg>  table angle    A90  A-45.5\r\n"
             " R<deg>  relative       R10  R-10\r\n"
-            " V<rpm>  speed          V6\r\n"
+            " V<rpm>  table speed    V1  (0.1-8.0)\r\n"
             " + / -   jog            S stop\r\n"
             " G  home   Z  zero   C  clear fault\r\n"
             " K<spr>  steps/rev      K3200\r\n"
@@ -488,14 +488,12 @@ static void dispatch(char *s)
       break;
 
     case 'V':
-      if (!parse_fix1(arg, &v) || (v < (int32_t)STEPPER_RPM10_MIN) ||
-          (v > (int32_t)STEPPER_RPM10_MAX))
+      if (!parse_fix1(arg, &v) || !App_SetSpeedRpm10((uint32_t)v))
       {
-        CLI_Print("ERR V (0.1-120.0)\r\n");
+        CLI_Print("ERR V (0.1-8.0 rpm)\r\n");
       }
       else
       {
-        (void)App_SetSpeedRpm10((uint32_t)v);
         Fmt_Fix1(num, v);
         CLI_Print("OK V=");
         CLI_Print(num);

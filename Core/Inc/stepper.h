@@ -28,9 +28,9 @@ extern "C" {
 #define STEPPER_SPR_MIN         200u
 #define STEPPER_SPR_MAX         12800u
 
-/* 转速设定范围，单位 0.1 rpm */
+/* 转速设定范围，单位 0.1 rpm（电机转速；转台转速 = 电机转速 / 减速比） */
 #define STEPPER_RPM10_MIN       1u
-#define STEPPER_RPM10_MAX       1200u
+#define STEPPER_RPM10_MAX       7500u
 
 /* 位置上限（步），防止 int32 溢出，约 30000 圈 @3200 */
 #define STEPPER_POS_LIMIT       100000000L

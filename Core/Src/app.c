@@ -1,4 +1,4 @@
-/**
+﻿/**
   ******************************************************************************
   * @file    app.c
   * @brief   定位、回零、限位报警与 OLED 界面
@@ -19,10 +19,16 @@
 #define LED_GPIO              GPIOA
 #define LED_PIN               GPIO_PIN_5
 
-#define HOME_RPM10            20u        /* 回零速度 2.0 rpm */
-#define HOME_BACKOFF_DEG10    20         /* 退出量 2.0 度 */
-#define HOME_TIMEOUT_MS       60000u     /* 找零超时（2rpm 下约 720 度行程） */
-#define HOME_SETTLE_MS        120u       /* 撞到限位后等待机械回弹 */
+/* 电机 : 转台 = 1 : 90，对外的角度、转速全部按“转台”计算 */
+#define GEAR_RATIO            90u
+
+#define APP_V_MIN             1u      /* 转台 0.1 rpm */
+#define APP_V_MAX             80u     /* 转台 8.0 rpm */
+
+#define HOME_RPM10            900u    /* 回零用电机转速 90 rpm = 转台 1 rpm */
+#define HOME_BACKOFF_DEG10    10      /* 退让 1.0 度（转台角度） */
+#define HOME_TIMEOUT_MS       120000u /* 找零超时 */
+#define HOME_SETTLE_MS        120u    /* 撞到限位后等待机械回弹 */
 
 #define F_NEAR                0x01u
 #define F_FAR                 0x02u
@@ -40,9 +46,31 @@ static uint8_t  s_home_phase = HOME_PHASE_NONE;
 static uint32_t s_home_tick  = 0u;
 static uint32_t s_home_rpm   = 60u;
 
+static uint32_t s_table_rpm10 = 10u;   /* 转台转速 1.0 rpm */
+
 static void ui_task(void);
 static void led_task(void);
 static void home_fail(void);
+
+/* -------------------------------------------------------------------------- */
+/* 减速比换算（对外角度单位 0.1 度，指转台角度）                                */
+/* -------------------------------------------------------------------------- */
+static int32_t table_deg10_to_steps(int32_t deg10)
+{
+  int64_t v = (int64_t)deg10 * (int64_t)GEAR_RATIO * (int64_t)Stepper_GetStepsPerRev();
+
+  v = (v >= 0) ? (v + 1800) / 3600 : (v - 1800) / 3600;
+  return (int32_t)v;
+}
+
+static int32_t steps_to_table_deg10(int32_t steps)
+{
+  int64_t den = (int64_t)GEAR_RATIO * (int64_t)Stepper_GetStepsPerRev();
+  int64_t v   = (int64_t)steps * 3600;
+
+  v = (v >= 0) ? (v + den / 2) / den : (v - den / 2) / den;
+  return (int32_t)v;
+}
 
 /* -------------------------------------------------------------------------- */
 /* 小工具                                                                     */
@@ -111,6 +139,10 @@ void App_Init(void)
   s_fault      = 0u;
   s_home_phase = HOME_PHASE_NONE;
 
+  /* 默认转台转速 1.0 rpm（电机 90 rpm），A 指令按转台角度走 */
+  s_table_rpm10 = 10u;
+  Stepper_SetSpeedRpm10(s_table_rpm10 * GEAR_RATIO);
+
   OLED_Init();
   OLED_Clear();
   ui_task();
@@ -134,9 +166,9 @@ bool App_MoveAbsDeg10(int32_t deg10)
   }
 
   pos    = Stepper_GetPosSteps();
-  target = Stepper_Deg10ToSteps(deg10);
+  target = table_deg10_to_steps(deg10);
 
-  /* 软件只做方向互锁，硬限位由 EXTI 立即刹车 */
+  /* 软件只做方向互锁，硬限位由去抖逻辑刹车 */
   if ((target < pos) && Stepper_LimitNearActive())
   {
     return false;
@@ -166,7 +198,7 @@ bool App_MoveRelDeg10(int32_t deg10)
   }
 
   pos    = Stepper_GetPosSteps();
-  target = pos + Stepper_Deg10ToSteps(deg10);
+  target = pos + table_deg10_to_steps(deg10);
 
   if ((target < pos) && Stepper_LimitNearActive())
   {
@@ -200,14 +232,24 @@ bool App_Jog(int8_t dir)
   return true;
 }
 
+/**
+  * @brief  设置转台转速（单位 0.1 rpm），内部换算成电机转速
+  */
 bool App_SetSpeedRpm10(uint32_t rpm10)
 {
-  if ((rpm10 < STEPPER_RPM10_MIN) || (rpm10 > STEPPER_RPM10_MAX))
+  if ((rpm10 < APP_V_MIN) || (rpm10 > APP_V_MAX))
   {
     return false;
   }
-  Stepper_SetSpeedRpm10(rpm10);
+
+  s_table_rpm10 = rpm10;
+  Stepper_SetSpeedRpm10(rpm10 * GEAR_RATIO);
   return true;
+}
+
+uint32_t App_GetSpeedRpm10(void)
+{
+  return s_table_rpm10;
 }
 
 bool App_SetSpr(uint32_t spr)
@@ -337,7 +379,7 @@ static void home_task(uint8_t limit_event)
     case HOME_PHASE_SETTLE:
       if ((HAL_GetTick() - s_home_tick) >= HOME_SETTLE_MS)
       {
-        back = Stepper_Deg10ToSteps(HOME_BACKOFF_DEG10);
+        back = table_deg10_to_steps(HOME_BACKOFF_DEG10);
         if (back < 1)
         {
           back = 1;
@@ -391,15 +433,15 @@ void App_PrintStatus(void)
   p = str_put(p, App_StateStr());
 
   p = str_put(p, " POS=");
-  Fmt_Fix1(num, Stepper_StepsToDeg10(Stepper_GetPosSteps()));
+  Fmt_Fix1(num, steps_to_table_deg10(Stepper_GetPosSteps()));
   p = str_put(p, num);
 
   p = str_put(p, " TGT=");
-  Fmt_Fix1(num, Stepper_StepsToDeg10(Stepper_GetTargetSteps()));
+  Fmt_Fix1(num, steps_to_table_deg10(Stepper_GetTargetSteps()));
   p = str_put(p, num);
 
   p = str_put(p, " V=");
-  fmt_rpm(num, Stepper_GetSpeedRpm10());
+  fmt_rpm(num, App_GetSpeedRpm10());
   p = str_put(p, num);
 
   p = str_put(p, " SPR=");
@@ -430,32 +472,67 @@ void App_PrintStatus(void)
 /* -------------------------------------------------------------------------- */
 /* 主循环                                                                     */
 /* -------------------------------------------------------------------------- */
+#define LIMIT_DEBOUNCE_MS   10u
+
 void App_Poll(void)
 {
-  uint8_t limit_event = Stepper_TakeLimitEvent();
+  static uint8_t  pending_lim = 0u;
+  static uint32_t pending_t0  = 0u;
+  uint8_t  confirmed = 0u;
+  uint8_t  event;
+  uint32_t now = HAL_GetTick();
+
+  /* 限位沿先记下来，10ms 后仍为低才算真撞限位（滤掉悬空/干扰毛刺） */
+  event = Stepper_TakeLimitEvent();
+  if (event != 0u)
+  {
+    pending_lim = event;
+    pending_t0  = now;
+  }
+
+  if ((pending_lim != 0u) && ((now - pending_t0) >= LIMIT_DEBOUNCE_MS))
+  {
+    uint8_t which = pending_lim;
+
+    pending_lim = 0u;
+
+    if (((which == 1u) && Stepper_LimitNearActive()) ||
+        ((which == 2u) && Stepper_LimitFarActive()))
+    {
+      confirmed = which;
+    }
+  }
 
   if (s_state == APP_HOMING)
   {
-    home_task(limit_event);
+    home_task(confirmed);
   }
-  else if (limit_event == 1u)
+  else if (confirmed == 1u)
   {
+    Stepper_Stop();
+    if ((s_fault & F_NEAR) == 0u)
+    {
+      CLI_Print("\r\n!LIMIT NEAR (PB0)\r\n");
+    }
     s_fault |= F_NEAR;
     s_state = APP_FAULT;
-    CLI_Print("\r\n!LIMIT NEAR (PB0)\r\n");
   }
-  else if (limit_event == 2u)
+  else if (confirmed == 2u)
   {
+    Stepper_Stop();
+    if ((s_fault & F_FAR) == 0u)
+    {
+      CLI_Print("\r\n!LIMIT FAR (PB1)\r\n");
+    }
     s_fault |= F_FAR;
     s_state = APP_FAULT;
-    CLI_Print("\r\n!LIMIT FAR (PB1)\r\n");
   }
   else if ((s_state == APP_MOVING) && !Stepper_IsBusy())
   {
     char num[16];
 
     s_state = APP_READY;
-    Fmt_Fix1(num, Stepper_StepsToDeg10(Stepper_GetPosSteps()));
+    Fmt_Fix1(num, steps_to_table_deg10(Stepper_GetPosSteps()));
     CLI_Print("DONE POS ");
     CLI_Print(num);
     CLI_Print("\r\n");
@@ -509,7 +586,7 @@ static void ui_build(char lines[4][17])
     {
       lines[0][i] = st[i];
     }
-    fmt_rpm(rpm, Stepper_GetSpeedRpm10());
+    fmt_rpm(rpm, App_GetSpeedRpm10());
     n = (uint8_t)strlen(rpm);
     for (i = 0u; i < n; i++)
     {
@@ -520,15 +597,15 @@ static void ui_build(char lines[4][17])
     lines[0][15] = 'm';
   }
 
-  /* 第 2 行：当前位置 */
-  Fmt_Fix1(num, ui_clamp_deg10(Stepper_StepsToDeg10(Stepper_GetPosSteps())));
+  /* 第 2 行：当前位置（转台角度） */
+  Fmt_Fix1(num, ui_clamp_deg10(steps_to_table_deg10(Stepper_GetPosSteps())));
   (void)strcpy(&lines[1][0], "POS ");
   (void)strcpy(&lines[1][4], num);
   n = (uint8_t)strlen(num);
   (void)strcpy(&lines[1][4u + n], "deg");
 
-  /* 第 3 行：目标位置 */
-  Fmt_Fix1(num, ui_clamp_deg10(Stepper_StepsToDeg10(Stepper_GetTargetSteps())));
+  /* 第 3 行：目标位置（转台角度） */
+  Fmt_Fix1(num, ui_clamp_deg10(steps_to_table_deg10(Stepper_GetTargetSteps())));
   (void)strcpy(&lines[2][0], "TGT ");
   (void)strcpy(&lines[2][4], num);
   n = (uint8_t)strlen(num);

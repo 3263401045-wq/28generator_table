@@ -21,6 +21,13 @@
 #define DIR_GPIO            GPIOA
 #define DIR_PIN             GPIO_PIN_12
 
+/* 脉冲输出：PA7 = TIM3_CH2
+   原设计用 PA6(TIM3_CH1)，实测该脚空闲只有 0.1V（应为 3.3V）已损坏，
+   改到同一定时器的 CH2，PA7 空闲且不与其他外设冲突。 */
+#define PULSE_GPIO          GPIOA
+#define PULSE_PIN           GPIO_PIN_7
+#define PULSE_TIM_CHANNEL   TIM_CHANNEL_2
+
 #define LIMIT_GPIO          GPIOB
 #define LIMIT_NEAR_PIN      GPIO_PIN_0
 #define LIMIT_FAR_PIN       GPIO_PIN_1
@@ -28,7 +35,8 @@
 /* -------------------------------------------------------------------------- */
 /* 脉冲时序参数                                                               */
 /* -------------------------------------------------------------------------- */
-#define PULSE_WIDTH_US      10u         /* TB6600 最小 2.5us，取 10us 余量 */
+#define PULSE_WIDTH_US      100u        /* TB6600 标称 >=2.5us，但输入端有滤波电容/
+                                           光耦较慢时 10us 可能被吃掉；取 100us 稳妥 */
 #define MAX_STEP_FREQ_HZ    40000u      /* 28 电机够用，且留足中断余量 */
 #define DIR_SETUP_US        20u         /* TB6600 要求方向建立 >= 5us */
 
@@ -159,7 +167,8 @@ static void apply_timing(void)
 
   TIM3->PSC  = (uint16_t)psc;
   TIM3->ARR  = (uint16_t)arr;
-  TIM3->CCR1 = (uint16_t)ccr;
+  TIM3->CCR2 = (uint16_t)ccr;   /* PA7 = TIM3_CH2 */
+  TIM3->CCR1 = (uint16_t)ccr;   /* PA6 = TIM3_CH1，双路同发，A6/A7 任选其一接线 */
 }
 
 /**
@@ -243,8 +252,7 @@ void TIM3_IRQHandler(void)
 /* -------------------------------------------------------------------------- */
 void Stepper_Init(void)
 {
-  GPIO_InitTypeDef   io = {0};
-  TIM_OC_InitTypeDef oc = {0};
+  GPIO_InitTypeDef io = {0};
 
   dwt_init();
 
@@ -257,12 +265,34 @@ void Stepper_Init(void)
   io.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(DIR_GPIO, &io);
 
-  /* 强制 PWM2 + 低极性，不依赖 tim.c 的默认配置 */
-  oc.OCMode     = TIM_OCMODE_PWM2;
-  oc.Pulse      = 500u;
-  oc.OCPolarity = TIM_OCPOLARITY_LOW;
-  oc.OCFastMode = TIM_OCFAST_DISABLE;
-  (void)HAL_TIM_PWM_ConfigChannel(&htim3, &oc, TIM_CHANNEL_1);
+  /* 脉冲引脚：PA6(TIM3_CH1) 与 PA7(TIM3_CH2) 都配成复用推挽，
+     两路输出同一串脉冲，接哪个都能用。 */
+  io.Pin   = PULSE_PIN;
+  io.Mode  = GPIO_MODE_AF_PP;
+  io.Pull  = GPIO_NOPULL;
+  io.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(PULSE_GPIO, &io);
+
+  io.Pin = GPIO_PIN_6;                 /* PA6 备用通道 */
+  HAL_GPIO_Init(GPIOA, &io);
+
+  /* 直接写寄存器配置 TIM3 的 CH1/CH2，不依赖 HAL 的通道状态机：
+       PWM 模式 2（CNT<CCR 无效=高，CNT>=CCR 有效=低，脉冲在周期末尾）
+       低极性（有效电平为低，正好驱动 TB6600 光耦）
+       CCR 预装载（运动中改速度不会撕脉冲） */
+  TIM3->CCMR1 &= (uint16_t)~(TIM_CCMR1_OC1M | TIM_CCMR1_OC2M);
+  TIM3->CCMR1 |= (uint16_t)(TIM_CCMR1_OC1M | TIM_CCMR1_OC2M);
+  TIM3->CCMR1 |= (uint16_t)(TIM_CCMR1_OC1PE | TIM_CCMR1_OC2PE);
+  TIM3->CCER  |= (uint16_t)(TIM_CCER_CC1E | TIM_CCER_CC1P |
+                            TIM_CCER_CC2E | TIM_CCER_CC2P);
+  TIM3->CCR1 = 500u;
+  TIM3->CCR2 = 500u;
+
+  /* 关键：立刻来一次更新事件，把 PSC/ARR/CCR 预装载值装进影子寄存器。
+     否则上电时影子 CCR=0，PWM2 判定 CNT>=CCR 为有效，输出会一直停在低电平
+     （光耦常通，电机只锁不转，引脚量出来只有 0.1V 左右）。 */
+  TIM3->EGR = TIM_EGR_UG;
+  __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
 
   HAL_NVIC_SetPriority(TIM3_IRQn, 2u, 0u);
   HAL_NVIC_EnableIRQ(TIM3_IRQn);
@@ -457,30 +487,24 @@ bool Stepper_LimitFarActive(void)
 }
 
 /**
-  * @brief  EXTI 回调（HAL 弱函数重载），EXTI 优先级 0，立即停脉冲
+  * @brief  EXTI 回调：只记录“哪个限位来了沿”，不在这里停机。
+  *         真正的停机和报警由 App 在 10 ms 去抖、确认电平仍为低之后执行，
+  *         避免限位线悬空/干扰时每个噪声沿都触发停机。
   */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  uint8_t which = 0u;
-
   if (GPIO_Pin == LIMIT_NEAR_PIN)
   {
-    which = 1u;
+    s_limit_event = 1u;
   }
   else if (GPIO_Pin == LIMIT_FAR_PIN)
   {
-    which = 2u;
+    s_limit_event = 2u;
   }
   else
   {
-    return;
+    /* 其它 EXTI 不处理 */
   }
-
-  pulse_stop();
-  s_left        = 0;
-  s_continuous  = 0u;
-  s_state       = STEPPER_IDLE;
-  s_limit_event = which;
 }
 
 uint8_t Stepper_TakeLimitEvent(void)
